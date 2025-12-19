@@ -1,0 +1,58 @@
+/*
+===============================================================================
+DDL Script: Create Silver Tables
+===============================================================================
+Script Purpose:
+    This script creates tables in the 'silver' schema, dropping existing tables 
+    if they already exist.
+	  Run this script to re-define the DDL structure of 'bronze' Tables
+===============================================================================
+*/
+
+IF OBJECT_ID('silver.title_basics', 'U') IS NOT NULL
+    DROP TABLE silver.title_basics;
+CREATE TABLE silver.title_basics (
+        tconst VARCHAR(50),
+        titleType VARCHAR(50),
+        primaryTitle VARCHAR(MAX),
+        originalTitle VARCHAR(MAX),
+        isAdult VARCHAR(10),
+        startYear VARCHAR(10),
+        endYear VARCHAR(10),
+        runtimeMinutes VARCHAR(10),
+        genres VARCHAR(MAX),
+        DW_LoadDate DATETIME DEFAULT GETDATE()
+    );
+
+IF OBJECT_ID('silver.title_ratings', 'U') IS NOT NULL
+    DROP TABLE silver.title_ratings;
+CREATE TABLE silver.title_ratings (
+        tconst VARCHAR(50),
+        averageRating VARCHAR(10),
+        numVotes VARCHAR(10),
+        DW_LoadDate DATETIME DEFAULT GETDATE()
+    );
+
+IF OBJECT_ID('silver.title_principals', 'U') IS NOT NULL
+    DROP TABLE silver.title_principals
+CREATE TABLE silver.title_principals (
+        tconst VARCHAR(50),
+        ordering VARCHAR(10),
+        nconst VARCHAR(50),
+        category VARCHAR(50),
+        job VARCHAR(MAX),
+        characters VARCHAR(MAX),
+        DW_LoadDate DATETIME DEFAULT GETDATE()
+    );
+
+IF OBJECT_ID('silver.name_basics', 'U') IS NOT NULL
+    DROP TABLE silver.name_basics
+CREATE TABLE silver.name_basics (
+        nconst VARCHAR(50),
+        primaryName VARCHAR(MAX),
+        birthYear VARCHAR(10),
+        deathYear VARCHAR(10),
+        primaryProfession VARCHAR(MAX),
+        knownForTitles VARCHAR(MAX),
+        DW_LoadDate DATETIME DEFAULT GETDATE()
+    );
