@@ -1,0 +1,190 @@
+-- Create Silver schema if not exists
+IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'silver')
+    EXEC('CREATE SCHEMA silver');
+GO
+
+-- Create error log table
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'silver.error_log') AND type IN (N'U'))
+BEGIN
+    CREATE TABLE silver.error_log (
+        proc_name VARCHAR(50),
+        error_row NVARCHAR(MAX),
+        error_desc VARCHAR(255),
+        timestamp DATETIME DEFAULT GETDATE()
+    );
+END
+GO
+
+-- Create movies table
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'silver.movies') AND type IN (N'U'))
+BEGIN
+    CREATE TABLE silver.movies (
+        movie_id VARCHAR(50) PRIMARY KEY,
+        title NVARCHAR(MAX),
+        year INT,
+        runtime_minutes INT,
+        genres VARCHAR(MAX),  -- Comma-separated string
+        DW_CreateDate DATETIME DEFAULT GETDATE()
+    );
+END
+GO
+
+-- Create ratings table
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'silver.ratings') AND type IN (N'U'))
+BEGIN
+    CREATE TABLE silver.ratings (
+        movie_id VARCHAR(50) PRIMARY KEY,
+        average_rating FLOAT,
+        num_votes INT,
+        DW_CreateDate DATETIME DEFAULT GETDATE()
+    );
+END
+GO
+
+-- Create cast_crew table
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'silver.cast_crew') AND type IN (N'U'))
+BEGIN
+    CREATE TABLE silver.cast_crew (
+        movie_id VARCHAR(50),
+        person_id VARCHAR(50),
+        person_name NVARCHAR(MAX),
+        role VARCHAR(50),
+        DW_CreateDate DATETIME DEFAULT GETDATE()
+    );
+END
+GO
+
+-- Stored Procedure for Silver Load (corrected CATCH insert)
+CREATE OR ALTER PROCEDURE silver.load_silver
+AS
+BEGIN
+    BEGIN TRY
+        DECLARE @start_time DATETIME = GETDATE();
+
+        -- Truncate Silver tables for full refresh
+        TRUNCATE TABLE silver.movies;
+        TRUNCATE TABLE silver.ratings;
+        TRUNCATE TABLE silver.cast_crew;
+
+        -- Staging and validation for movies
+        DROP TABLE IF EXISTS #staging_movies;
+        CREATE TABLE #staging_movies (
+            movie_id VARCHAR(50),
+            title NVARCHAR(MAX),
+            year VARCHAR(10),
+            runtime_minutes VARCHAR(10),
+            genres VARCHAR(MAX)
+        );
+
+        INSERT INTO #staging_movies (movie_id, title, year, runtime_minutes, genres)
+        SELECT tconst, primaryTitle, startYear, runtimeMinutes, genres
+        FROM bronze.title_basics
+        WHERE titleType = 'movie';
+
+        -- Log duplicates in staging
+        INSERT INTO silver.error_log (proc_name, error_row, error_desc)
+        SELECT 'load_silver', movie_id, 'Duplicate movie_id'
+        FROM #staging_movies
+        GROUP BY movie_id
+        HAVING COUNT(*) > 1;
+
+        -- Insert clean rows to Silver, log bad ones
+        DECLARE @error_log TABLE (error_row NVARCHAR(MAX), error_desc VARCHAR(255));
+        INSERT INTO silver.movies (movie_id, title, year, runtime_minutes, genres)
+        SELECT 
+            movie_id,
+            NULLIF(title, '') AS title,
+            TRY_CAST(NULLIF(year, '\\N') AS INT) AS year,
+            TRY_CAST(NULLIF(runtime_minutes, '\\N') AS INT) AS runtime_minutes,
+            NULLIF(genres, '\\N') AS genres
+        FROM #staging_movies
+        WHERE TRY_CAST(NULLIF(year, '\\N') AS INT) IS NOT NULL
+          AND TRY_CAST(NULLIF(year, '\\N') AS INT) >= 2000
+          AND TRY_CAST(NULLIF(runtime_minutes, '\\N') AS INT) >= 0
+          AND LEN(title) BETWEEN 1 AND 1000;
+
+        -- Log bad rows
+        INSERT INTO @error_log (error_row, error_desc)
+        SELECT movie_id, 'Invalid year, runtime, or title length'
+        FROM #staging_movies
+        WHERE TRY_CAST(NULLIF(year, '\\N') AS INT) IS NULL
+           OR TRY_CAST(NULLIF(year, '\\N') AS INT) < 2000
+           OR TRY_CAST(NULLIF(runtime_minutes, '\\N') AS INT) < 0
+           OR LEN(title) NOT BETWEEN 1 AND 1000
+           OR title IS NULL;
+
+        IF EXISTS (SELECT 1 FROM @error_log)
+            INSERT INTO silver.error_log (proc_name, error_row, error_desc)
+            SELECT 'load_silver', error_row, error_desc FROM @error_log;
+
+        -- Staging and validation for ratings
+        DROP TABLE IF EXISTS #staging_ratings;
+        CREATE TABLE #staging_ratings (
+            movie_id VARCHAR(50),
+            average_rating VARCHAR(10),
+            num_votes VARCHAR(10)
+        );
+
+        INSERT INTO #staging_ratings (movie_id, average_rating, num_votes)
+        SELECT tconst, averageRating, numVotes
+        FROM bronze.title_ratings;
+
+        INSERT INTO silver.ratings (movie_id, average_rating, num_votes)
+        SELECT 
+            movie_id,
+            TRY_CAST(NULLIF(average_rating, '\\N') AS FLOAT) AS average_rating,
+            TRY_CAST(NULLIF(num_votes, '\\N') AS INT) AS num_votes
+        FROM #staging_ratings
+        WHERE TRY_CAST(NULLIF(average_rating, '\\N') AS FLOAT) BETWEEN 0 AND 10
+          AND TRY_CAST(NULLIF(num_votes, '\\N') AS INT) >= 0;
+
+        -- Log bad ratings
+        INSERT INTO @error_log (error_row, error_desc)
+        SELECT movie_id, 'Invalid average_rating or num_votes'
+        FROM #staging_ratings
+        WHERE TRY_CAST(NULLIF(average_rating, '\\N') AS FLOAT) IS NULL
+           OR TRY_CAST(NULLIF(average_rating, '\\N') AS FLOAT) NOT BETWEEN 0 AND 10
+           OR TRY_CAST(NULLIF(num_votes, '\\N') AS INT) < 0;
+
+        IF EXISTS (SELECT 1 FROM @error_log)
+            INSERT INTO silver.error_log (proc_name, error_row, error_desc)
+            SELECT 'load_silver', error_row, error_desc FROM @error_log;
+
+        -- Staging and validation for cast_crew
+        DROP TABLE IF EXISTS #staging_cast_crew;
+        CREATE TABLE #staging_cast_crew (
+            movie_id VARCHAR(50),
+            person_id VARCHAR(50),
+            person_name NVARCHAR(MAX),
+            role VARCHAR(50)
+        );
+
+        INSERT INTO #staging_cast_crew (movie_id, person_id, person_name, role)
+        SELECT p.tconst, p.nconst, n.primaryName, p.category
+        FROM bronze.title_principals p
+        LEFT JOIN bronze.name_basics n ON p.nconst = n.nconst;
+
+        -- Log unmatched joins
+        INSERT INTO silver.error_log (proc_name, error_row, error_desc)
+        SELECT 'load_silver', person_id, 'Unmatched nconst in name_basics'
+        FROM #staging_cast_crew
+        WHERE person_name IS NULL;
+
+        -- Insert clean rows
+        INSERT INTO silver.cast_crew (movie_id, person_id, person_name, role)
+        SELECT movie_id, person_id, NULLIF(person_name, '\\N'), NULLIF(role, '\\N')
+        FROM #staging_cast_crew
+        WHERE person_name IS NOT NULL
+          AND LEN(person_name) BETWEEN 1 AND 500;
+
+        DECLARE @end_time DATETIME = GETDATE();
+        PRINT 'Silver load completed in ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS VARCHAR) + ' seconds.';
+        PRINT 'Check silver.error_log for any issues.';
+    END TRY
+    BEGIN CATCH
+        INSERT INTO silver.error_log (proc_name, error_desc)  -- Corrected column name
+        VALUES ('load_silver', ERROR_MESSAGE());
+        PRINT 'Critical error: ' + ERROR_MESSAGE();
+    END CATCH
+END;
+GO
