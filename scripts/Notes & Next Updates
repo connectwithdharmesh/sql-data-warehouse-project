@@ -1,0 +1,17 @@
+Daily Run Process
+
+Refresh Bronze (Ingestion): Rerun ingest_imdb.py to download/update TSV files if IMDB has new data (check via file dates to skip unchanged ones).
+Refresh Silver: Run EXEC silver.load_silver; to clean and load from Bronze (incremental if you adapt to MERGE in future).
+Refresh Gold: Run EXEC gold.load_gold; to apply transformations (MERGE ensures incrementality, e.g., only recalculates updated popularity scores).
+
+This keeps the pipeline fresh without manual full reloads
+
+
+Suggestions at My Discretion
+
+Automate with SQL Agent Job: In SSMS, right-click SQL Server Agent (start if stopped) > New > Job > Name: Daily_IMDB_Refresh > Steps > New Step: Type T-SQL, Command: EXEC silver.load_silver; EXEC gold.load_gold; > Schedule: Daily at midnight. This runs automatically, no manual exec needed.
+Integrate Ingestion: Add a step calling Python script via xp_cmdshell (enable with sp_configure 'xp_cmdshell', 1;), or use Airflow for full orchestration (bonus Part 5).
+Monitor and Alert: Add email notifications in the job (Operators > New Operator) if error_log has new rows post-run.
+Backup Before Runs: Add BACKUP DATABASE DataWarehouse TO DISK = 'D:\Backup\DataWarehouse_daily.bak'; as a job step for safety.
+
+This makes your pipeline production-ready.
