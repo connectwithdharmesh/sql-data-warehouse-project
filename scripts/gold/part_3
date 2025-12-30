@@ -1,1 +1,154 @@
+-- Stored Procedure for Loading Gold Layer
+-- Purpose: Applies business transformations to Silver data for analytics-ready outputs (Part 3).
+-- Flow: Checks/creates tables > Uses MERGE for incremental loads (upserts: insert new, update existing based on keys).
+-- Why MERGE? Enables daily incremental updates (Part 4), avoiding full reloads/duplicates; efficient for changing data like ratings.
+-- Notes: Call with EXEC gold.load_gold; for daily runs, schedule via SQL Agent Job. Assumes Silver is loaded.
+-- Run SELECT * FROM gold.director_analytics_table;
+CREATE OR ALTER PROCEDURE gold.load_gold
+AS
+BEGIN
+    BEGIN TRY
+        -- Task 1: Movie Popularity Score Table (incremental MERGE)
+        -- Purpose: Calculates popularity_score and stores/udpates in a physical table for Task 1.
+        -- Why physical table? Task says "store result in a new table"; MERGE handles increments (new movies or updated ratings).
+        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'gold.movie_popularity') AND type IN (N'U'))
+        BEGIN
+            CREATE TABLE gold.movie_popularity (
+                movie_id VARCHAR(50) PRIMARY KEY,  -- Unique key for MERGE matching
+                title NVARCHAR(MAX),
+                average_rating FLOAT,
+                num_votes INT,
+                popularity_score FLOAT,  -- Rounded to 2 decimals
+                DW_CreateDate DATETIME DEFAULT GETDATE(),  -- Load timestamp
+                DW_UpdateDate DATETIME NULL  -- Last update for tracking changes
+            );
+        END;
 
+        -- MERGE operation: Upsert from Silver (update if exists, insert if new)
+        -- Why? For daily runs, refreshes only changed data (e.g., new ratings) without duplicating.
+        MERGE gold.movie_popularity AS target
+        USING (
+            SELECT 
+                m.movie_id,
+                m.title,
+                r.average_rating,
+                r.num_votes,
+                ROUND(r.average_rating * LOG10(NULLIF(r.num_votes, 0)), 2) AS popularity_score  -- Formula with rounding
+            FROM silver.movies m
+            INNER JOIN silver.ratings r ON m.movie_id = r.movie_id
+        ) AS source
+        ON target.movie_id = source.movie_id
+        WHEN MATCHED THEN
+            UPDATE SET 
+                title = source.title,
+                average_rating = source.average_rating,
+                num_votes = source.num_votes,
+                popularity_score = source.popularity_score,
+                DW_UpdateDate = GETDATE()  -- Mark as updated
+        WHEN NOT MATCHED THEN
+            INSERT (movie_id, title, average_rating, num_votes, popularity_score, DW_CreateDate)
+            VALUES (source.movie_id, source.title, source.average_rating, source.num_votes, source.popularity_score, GETDATE());
+
+        PRINT 'Movie popularity rows merged: ' + CAST(@@ROWCOUNT AS VARCHAR);
+
+        -- Task 2: Top Movies by Genre Table (incremental MERGE; exports view as table)
+        -- Purpose: Materializes the top 10 movies per genre with num_votes, as a table for export (per your request).
+        -- Why table? Allows export as static file; MERGE for increments if popularity changes.
+        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'gold.top_movies_by_genre_table') AND type IN (N'U'))
+        BEGIN
+            CREATE TABLE gold.top_movies_by_genre_table (
+                genre VARCHAR(50),
+                movie_id VARCHAR(50),
+                title NVARCHAR(MAX),
+                popularity_score FLOAT,  -- Rounded to 2 decimals
+                num_votes INT,  -- Added for filter transparency (>5000)
+                DW_CreateDate DATETIME DEFAULT GETDATE(),
+                DW_UpdateDate DATETIME NULL
+            );
+        END;
+
+        -- MERGE operation: Uses CTE for ranking; upserts based on genre/movie_id composite key.
+        -- Why? Handles updates if scores change; STRING_SPLIT splits genres on-the-fly.
+        MERGE gold.top_movies_by_genre_table AS target
+        USING (
+            SELECT 
+                genre,
+                movie_id,
+                title,
+                popularity_score,
+                num_votes
+            FROM (
+                SELECT 
+                    TRIM(g.value) AS genre,
+                    p.movie_id,
+                    p.title,
+                    p.popularity_score,
+                    r.num_votes,
+                    ROW_NUMBER() OVER (PARTITION BY TRIM(g.value) ORDER BY p.popularity_score DESC) AS rn
+                FROM gold.movie_popularity p
+                INNER JOIN silver.movies m ON p.movie_id = m.movie_id
+                INNER JOIN silver.ratings r ON p.movie_id = r.movie_id
+                CROSS APPLY STRING_SPLIT(m.genres, ',') g
+                WHERE r.num_votes >= 5000
+            ) AS Ranked
+            WHERE rn <= 10
+        ) AS source
+        ON target.genre = source.genre AND target.movie_id = source.movie_id
+        WHEN MATCHED THEN
+            UPDATE SET 
+                title = source.title,
+                popularity_score = source.popularity_score,
+                num_votes = source.num_votes,
+                DW_UpdateDate = GETDATE()
+        WHEN NOT MATCHED THEN
+            INSERT (genre, movie_id, title, popularity_score, num_votes, DW_CreateDate)
+            VALUES (source.genre, source.movie_id, source.title, source.popularity_score, source.num_votes, GETDATE());
+
+        PRINT 'Top movies by genre rows merged: ' + CAST(@@ROWCOUNT AS VARCHAR);
+
+        -- Task 3: Director Analytics Table (incremental MERGE; exports view as table with rounded avg)
+        -- Purpose: Materializes top 5 directors with rounded avg score.
+        -- Why table? For export; MERGE for updates if popularity changes.
+        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'gold.director_analytics_table') AND type IN (N'U'))
+        BEGIN
+            CREATE TABLE gold.director_analytics_table (
+                director NVARCHAR(MAX),
+                avg_popularity_score FLOAT,  -- Rounded to 2 decimals
+                movie_count INT,
+                DW_CreateDate DATETIME DEFAULT GETDATE(),
+                DW_UpdateDate DATETIME NULL
+            );
+        END;
+
+        -- MERGE operation: Top 5 with grouping; upserts based on director name.
+        MERGE gold.director_analytics_table AS target
+        USING (
+            SELECT TOP 5
+                c.person_name AS director,
+                ROUND(AVG(p.popularity_score), 2) AS avg_popularity_score,  -- Rounded
+                COUNT(DISTINCT c.movie_id) AS movie_count
+            FROM silver.cast_crew c
+            INNER JOIN gold.movie_popularity p ON c.movie_id = p.movie_id
+            INNER JOIN silver.movies m ON c.movie_id = m.movie_id
+            WHERE c.role = 'director' AND m.year >= 2000
+            GROUP BY c.person_name
+            HAVING COUNT(DISTINCT c.movie_id) >= 3
+            ORDER BY avg_popularity_score DESC
+        ) AS source
+        ON target.director = source.director
+        WHEN MATCHED THEN
+            UPDATE SET 
+                avg_popularity_score = source.avg_popularity_score,
+                movie_count = source.movie_count,
+                DW_UpdateDate = GETDATE()
+        WHEN NOT MATCHED THEN
+            INSERT (director, avg_popularity_score, movie_count, DW_CreateDate)
+            VALUES (source.director, source.avg_popularity_score, source.movie_count, GETDATE());
+
+        PRINT 'Director analytics rows merged: ' + CAST(@@ROWCOUNT AS VARCHAR);
+    END TRY
+    BEGIN CATCH
+        PRINT 'Critical error in gold.load_gold: ' + ERROR_MESSAGE();
+    END CATCH
+END;
+GO
