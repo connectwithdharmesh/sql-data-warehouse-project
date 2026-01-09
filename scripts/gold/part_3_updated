@@ -1,0 +1,114 @@
+-- Comprehensive Script to Reproduce Gold Layer Tables
+-- Purpose: This script recreates and populates all known gold layer tables (currently only top_movies_by_genre_table).
+--          It assumes the silver layer is already loaded (via EXEC silver.load_silver; if needed).
+--          Run this in your SQL Server environment to fully reproduce the gold layer from scratch.
+-- Notes: 
+--   - If additional gold tables exist in your setup, extend this script accordingly.
+--   - Handles schema creation, table drop/recreate for freshness, procedure creation, and execution.
+--   - Requires SQL Server 2016+ for STRING_SPLIT and TRY_CAST.
+
+-- Step 1: Ensure gold schema exists (if using schemas; adjust if not).
+IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'gold')
+BEGIN
+    EXEC('CREATE SCHEMA gold');
+END
+GO
+
+-- Step 2: Drop and recreate the top_movies_by_genre_table for a clean start.
+--         This ensures the table schema is up-to-date and data is refreshed.
+DROP TABLE IF EXISTS gold.top_movies_by_genre_table;
+CREATE TABLE gold.top_movies_by_genre_table (
+    genre VARCHAR(50),
+    movie_id VARCHAR(50),
+    title NVARCHAR(MAX),
+    year INT,
+    runtime_minutes INT,
+    average_rating FLOAT,
+    num_votes INT,
+    rank INT
+);
+GO
+
+-- Step 3: Create or alter the loading procedure for top_movies_by_genre_table.
+CREATE OR ALTER PROCEDURE gold.load_gold_top_movies_by_genre
+AS
+BEGIN
+    BEGIN TRY
+        DECLARE @start_time DATETIME = GETDATE();
+        DECLARE @top_n INT = 10;  -- Configurable: Number of top movies per genre.
+        DECLARE @processed_count INT;
+
+        -- Truncate gold table for full refresh (though we dropped it above, this is for future runs).
+        TRUNCATE TABLE gold.top_movies_by_genre_table;
+
+        -- Derive and insert top movies by genre.
+        ;WITH GenreSplit AS (
+            SELECT 
+                m.movie_id,
+                m.title,
+                m.year,
+                m.runtime_minutes,
+                r.average_rating,
+                r.num_votes,
+                TRIM(VALUE) AS genre  -- TRIM to handle any leading/trailing spaces.
+            FROM silver.movies m
+            INNER JOIN silver.ratings r ON m.movie_id = r.movie_id
+            CROSS APPLY STRING_SPLIT(m.genres, ',')  -- Unnest comma-separated genres.
+            WHERE m.genres IS NOT NULL  -- Exclude movies with NULL genres (formerly '\N').
+              AND TRIM(VALUE) <> ''  -- Skip empty genres after split.
+              AND TRIM(VALUE) IS NOT NULL  -- Redundant but safe.
+              AND r.average_rating >= 0  -- Optional: Basic rating filter.
+        ),
+        RankedMovies AS (
+            SELECT 
+                genre,
+                movie_id,
+                title,
+                year,
+                runtime_minutes,
+                average_rating,
+                num_votes,
+                ROW_NUMBER() OVER (PARTITION BY genre ORDER BY average_rating DESC, num_votes DESC, year DESC) AS rank
+            FROM GenreSplit
+        )
+        INSERT INTO gold.top_movies_by_genre_table (genre, movie_id, title, year, runtime_minutes, average_rating, num_votes, rank)
+        SELECT 
+            genre,
+            movie_id,
+            title,
+            year,
+            runtime_minutes,
+            average_rating,
+            num_votes,
+            rank
+        FROM RankedMovies
+        WHERE rank <= @top_n;  -- Limit to top N per genre.
+
+        SELECT @processed_count = @@ROWCOUNT;
+        PRINT 'Gold top_movies_by_genre_table loaded with ' + CAST(@processed_count AS VARCHAR) + ' rows.';
+
+        DECLARE @end_time DATETIME = GETDATE();
+        PRINT 'Gold load completed in ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS VARCHAR) + ' seconds.';
+    END TRY
+    BEGIN CATCH
+        PRINT 'Error in gold.load_gold_top_movies_by_genre: ' + ERROR_MESSAGE();
+        -- Optionally, insert into an error log table if available (e.g., silver.error_log).
+    END CATCH
+END;
+GO
+
+/*
+-- Step 4: Execute the procedure to populate the table.
+--         Prerequisite: Ensure silver layer is loaded (run EXEC silver.load_silver; first if needed).
+EXEC gold.load_gold_top_movies_by_genre;
+GO
+
+-- Step 5: Validation Query (Optional: Run this to verify no '\N' issues and sample data).
+SELECT TOP 10 * 
+FROM gold.top_movies_by_genre_table 
+WHERE genre LIKE '%\N%' OR genre IS NULL;  -- Should return 0 rows if clean.
+
+SELECT TOP 5 * 
+FROM gold.top_movies_by_genre_table 
+ORDER BY genre, rank;  -- Sample top movies per genre.
+GO *\
