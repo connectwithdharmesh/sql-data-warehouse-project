@@ -1,0 +1,192 @@
+CREATE OR ALTER PROCEDURE silver.load_silver
+AS
+BEGIN
+    BEGIN TRY
+        -- Declare variables at the top for scope (T-SQL requirement).
+        -- These track counts for diagnostics and logging bad data.
+        DECLARE @start_time DATETIME = GETDATE(); -- Tracks procedure start time for performance measurement.
+        DECLARE @error_log TABLE (error_row NVARCHAR(MAX), error_desc VARCHAR(1000)); -- Temp table for staging bad rows before logging.
+        DECLARE @staging_movies_count INT; -- Count of raw staged movies rows.
+        DECLARE @clean_movies_count INT; -- Count of clean movies inserted.
+        DECLARE @bad_movies_count INT; -- Count of bad movies logged.
+        DECLARE @staging_ratings_count INT;
+        DECLARE @clean_ratings_count INT;
+        DECLARE @bad_ratings_count INT;
+        DECLARE @staging_cast_crew_count INT;
+        DECLARE @clean_cast_crew_count INT;
+        -- Truncate Silver tables for full refresh.
+        -- Purpose: Clears existing data to ensure fresh load; suitable for snapshot datasets like IMDB.
+        TRUNCATE TABLE silver.movies;
+        TRUNCATE TABLE silver.ratings;
+        TRUNCATE TABLE silver.cast_crew;
+        -- Staging and validation for movies table.
+        -- Purpose: Load raw qualifying data into temp table for processing without affecting final Silver.
+        DROP TABLE IF EXISTS #staging_movies; -- Drop if exists to avoid errors on reruns.
+        CREATE TABLE #staging_movies (
+            movie_id VARCHAR(50),
+            title NVARCHAR(MAX),
+            year VARCHAR(10), -- Kept as string for initial validation.
+            runtime_minutes VARCHAR(10),
+            genres VARCHAR(MAX)
+        );
+        INSERT INTO #staging_movies (movie_id, title, year, runtime_minutes, genres)
+        SELECT tconst, primaryTitle, startYear, runtimeMinutes, genres
+        FROM bronze.title_basics
+        WHERE titleType = 'movie'; -- Initial filter for movies only (assignment rule).
+        SELECT @staging_movies_count = @@ROWCOUNT; -- @@ROWCOUNT captures rows from last statement.
+        PRINT 'Staging movies count: ' + CAST(@staging_movies_count AS VARCHAR); -- Diagnostic print.
+        -- Log duplicates in staging.
+        -- Purpose: Detect and log any duplicate movie_ids (though rare in IMDB, for data quality).
+        INSERT INTO silver.error_log (proc_name, error_row, error_desc)
+        SELECT 'load_silver', movie_id, 'Duplicate movie_id detected'
+        FROM #staging_movies
+        GROUP BY movie_id
+        HAVING COUNT(*) > 1;
+        -- Dedup and rank by completeness.
+        -- Purpose: If duplicates exist, rank rows by how "complete" they are (non-null fields) and keep the best one.
+        ;WITH DedupCTE AS (
+            SELECT *,
+                (CASE WHEN title IS NOT NULL AND title <> '' THEN 1 ELSE 0 END +
+                 CASE WHEN year IS NOT NULL AND year <> '\N' THEN 1 ELSE 0 END +
+                 CASE WHEN runtime_minutes IS NOT NULL AND runtime_minutes <> '\N' THEN 1 ELSE 0 END +
+                 CASE WHEN genres IS NOT NULL AND genres <> '\N' THEN 1 ELSE 0 END) AS completeness_score -- Score based on non-null columns.
+            FROM #staging_movies
+        ),
+        RankedCTE AS (
+            SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY movie_id ORDER BY completeness_score DESC) AS rn -- Rank duplicates, keep highest score.
+            FROM DedupCTE
+        )
+        -- Insert clean, deduped rows to Silver.
+        -- Purpose: Apply final validation, convert types, handle nulls, and load only passing rows.
+        INSERT INTO silver.movies (movie_id, title, year, runtime_minutes, genres)
+        SELECT
+            movie_id,
+            NULLIF(title, '') AS title, -- Replace empty strings with NULL.
+            TRY_CAST(NULLIF(year, '\N') AS INT) AS year, -- Safe cast, NULL on failure or "\N".
+            TRY_CAST(NULLIF(runtime_minutes, '\N') AS INT) AS runtime_minutes,
+            NULLIF(genres, '\N') AS genres
+        FROM RankedCTE
+        WHERE rn = 1 -- Keep only the best duplicate.
+          AND TRY_CAST(NULLIF(year, '\N') AS INT) IS NOT NULL -- Valid year.
+          AND TRY_CAST(NULLIF(year, '\N') AS INT) >= 2000 -- Assignment filter.
+          AND TRY_CAST(NULLIF(runtime_minutes, '\N') AS INT) > 0 -- Positive runtime.
+          AND LEN(title) BETWEEN 1 AND 1000; -- Reasonable length.
+        SELECT @clean_movies_count = @@ROWCOUNT;
+        PRINT 'Clean movies inserted: ' + CAST(@clean_movies_count AS VARCHAR);
+        -- Log bad rows.
+        -- Purpose: Capture and log rows that failed validation for auditing.
+        INSERT INTO @error_log (error_row, error_desc)
+        SELECT movie_id, 'Invalid year or runtime (including 0 or negative), or title length'
+        FROM #staging_movies
+        WHERE TRY_CAST(NULLIF(year, '\N') AS INT) IS NULL
+           OR TRY_CAST(NULLIF(year, '\N') AS INT) < 2000
+           OR TRY_CAST(NULLIF(runtime_minutes, '\N') AS INT) <= 0
+           OR LEN(title) NOT BETWEEN 1 AND 1000
+           OR title IS NULL;
+        SELECT @bad_movies_count = COUNT(*) FROM @error_log;
+        PRINT 'Bad movies rows detected: ' + CAST(@bad_movies_count AS VARCHAR);
+        IF @bad_movies_count > 0
+            INSERT INTO silver.error_log (proc_name, error_row, error_desc)
+            SELECT 'load_silver', error_row, error_desc FROM @error_log;
+        -- Staging and validation for ratings (similar dedup and cleaning)
+        DROP TABLE IF EXISTS #staging_ratings;
+        CREATE TABLE #staging_ratings (
+            movie_id VARCHAR(50),
+            average_rating VARCHAR(10),
+            num_votes VARCHAR(10)
+        );
+        INSERT INTO #staging_ratings (movie_id, average_rating, num_votes)
+        SELECT tconst, averageRating, numVotes
+        FROM bronze.title_ratings;
+        SELECT @staging_ratings_count = COUNT(*) FROM #staging_ratings;
+        PRINT 'Staging ratings count: ' + CAST(@staging_ratings_count AS VARCHAR);
+        -- Dedup and rank by completeness
+        ;WITH DedupCTE AS (
+            SELECT *,
+                (CASE WHEN average_rating IS NOT NULL AND average_rating <> '\N' THEN 1 ELSE 0 END +
+                 CASE WHEN num_votes IS NOT NULL AND num_votes <> '\N' THEN 1 ELSE 0 END) AS completeness_score
+            FROM #staging_ratings
+        ),
+        RankedCTE AS (
+            SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY movie_id ORDER BY completeness_score DESC) AS rn
+            FROM DedupCTE
+        )
+        INSERT INTO silver.ratings (movie_id, average_rating, num_votes)
+        SELECT
+            movie_id,
+            TRY_CAST(NULLIF(average_rating, '\N') AS FLOAT) AS average_rating,
+            TRY_CAST(NULLIF(num_votes, '\N') AS INT) AS num_votes
+        FROM RankedCTE
+        WHERE rn = 1
+          AND TRY_CAST(NULLIF(average_rating, '\N') AS FLOAT) BETWEEN 0 AND 10
+          AND TRY_CAST(NULLIF(num_votes, '\N') AS INT) >= 0;
+        SELECT @clean_ratings_count = @@ROWCOUNT;
+        PRINT 'Clean ratings inserted: ' + CAST(@clean_ratings_count AS VARCHAR);
+        -- Log bad ratings
+        INSERT INTO @error_log (error_row, error_desc)
+        SELECT movie_id, 'Invalid average_rating or num_votes'
+        FROM #staging_ratings
+        WHERE TRY_CAST(NULLIF(average_rating, '\N') AS FLOAT) IS NULL
+           OR TRY_CAST(NULLIF(average_rating, '\N') AS FLOAT) NOT BETWEEN 0 AND 10
+           OR TRY_CAST(NULLIF(num_votes, '\N') AS INT) < 0;
+        SELECT @bad_ratings_count = COUNT(*) FROM @error_log;
+        PRINT 'Bad ratings rows detected: ' + CAST(@bad_ratings_count AS VARCHAR);
+        IF @bad_ratings_count > 0
+            INSERT INTO silver.error_log (proc_name, error_row, error_desc)
+            SELECT 'load_silver', error_row, error_desc FROM @error_log;
+        -- Staging and validation for cast_crew (dedup on composite key)
+        DROP TABLE IF EXISTS #staging_cast_crew;
+        CREATE TABLE #staging_cast_crew (
+            movie_id VARCHAR(50),
+            person_id VARCHAR(50),
+            person_name NVARCHAR(MAX),
+            role VARCHAR(50)
+        );
+        INSERT INTO #staging_cast_crew (movie_id, person_id, person_name, role)
+        SELECT p.tconst, p.nconst, n.primaryName, p.category
+        FROM bronze.title_principals p
+        LEFT JOIN bronze.name_basics n ON p.nconst = n.nconst;
+        SELECT @staging_cast_crew_count = COUNT(*) FROM #staging_cast_crew;
+        PRINT 'Staging cast_crew count: ' + CAST(@staging_cast_crew_count AS VARCHAR);
+        -- Log unmatched joins
+        INSERT INTO silver.error_log (proc_name, error_row, error_desc)
+        SELECT 'load_silver', person_id, 'Unmatched nconst in name_basics'
+        FROM #staging_cast_crew
+        WHERE person_name IS NULL;
+        -- Dedup and rank by completeness
+        ;WITH DedupCTE AS (
+            SELECT *,
+                (CASE WHEN person_name IS NOT NULL AND person_name <> '\N' THEN 1 ELSE 0 END +
+                 CASE WHEN role IS NOT NULL AND role <> '\N' THEN 1 ELSE 0 END) AS completeness_score
+            FROM #staging_cast_crew
+        ),
+        RankedCTE AS (
+            SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY movie_id, person_id ORDER BY completeness_score DESC) AS rn
+            FROM DedupCTE
+        )
+        -- Insert clean rows
+        INSERT INTO silver.cast_crew (movie_id, person_id, person_name, role)
+        SELECT movie_id, person_id, NULLIF(person_name, '\N'), NULLIF(role, '\N')
+        FROM RankedCTE
+        WHERE rn = 1
+          AND person_name IS NOT NULL
+          AND LEN(person_name) BETWEEN 1 AND 500;
+        SELECT @clean_cast_crew_count = @@ROWCOUNT;
+        PRINT 'Clean cast_crew inserted: ' + CAST(@clean_cast_crew_count AS VARCHAR);
+        DECLARE @end_time DATETIME = GETDATE();
+        PRINT 'Silver load completed in ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS VARCHAR) + ' seconds.';
+        PRINT 'Check silver.error_log for any issues.';
+    END TRY
+    BEGIN CATCH
+        INSERT INTO silver.error_log (proc_name, error_desc)
+        VALUES ('load_silver', ERROR_MESSAGE());
+        PRINT 'Critical error: ' + ERROR_MESSAGE();
+    END CATCH
+END;
+
+-- EXEC silver.load_silver;
+
+-- SELECT TOP 10 * FROM silver.movies WHERE genres LIKE '%\N%' OR genres IS NULL;
